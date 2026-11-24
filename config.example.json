@@ -1,0 +1,14 @@
+{
+  "kimi_api_key": "",
+  "kimi_base_url": "https://api.moonshot.cn/v1",
+  "kimi_model": "kimi-k3.1-pro",
+  "wiki_base_url": "http://127.0.0.1:8787/api/wiki",
+  "wiki_rag_token": "",
+  "data_dir": "data",
+  "web_root": "web",
+  "port": 8790,
+  "top_k": 5,
+  "chunk_size": 700,
+  "chunk_overlap": 100,
+  "max_context_chars": 18000
+}

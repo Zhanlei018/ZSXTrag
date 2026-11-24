@@ -1,0 +1,141 @@
+diff --git a/.env.example b/.env.example
+index 5c93041..ada756c 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,3 +1,4 @@
+ DEEPSEEK_API_KEY=
+ DEEPSEEK_BASE_URL=https://api.deepseek.com
+ DEEPSEEK_MODEL=deepseek-flash
++RAG_PORT=8790
+diff --git a/README.md b/README.md
+index 96d34ab..f5d1ffb 100644
+--- a/README.md
++++ b/README.md
+@@ -18,6 +18,8 @@ npm run dev
+ 
+ 打开 http://127.0.0.1:5173 。修改配置后重启。
+ 
++RAG 模式需先启动 HXrag（默认 `127.0.0.1:8790`），并在 HXrag 的 `config.json` 中配置 Kimi。可用 `RAG_PORT` 修改代理目标端口。
++
+ ## 构建与测试
+ 
+ ```sh
+@@ -32,9 +34,5 @@ npm test
+ 
+ - `llm-wiki/`：Wiki 服务、解析、SQLite。
+ - `frontend/`：界面和本地入口。
+-- `rag/`：预留问答接口。
++- `rag/`：原预留入口包；当前问答由独立 HXrag 服务提供。
+ - `docs/`：[接口](docs/API.md)、[开发](docs/DEVELOPMENT.md)。
+-
+-## 未完成
+-
+-RAG 的索引、检索与问答后端。
+diff --git a/docs/API.md b/docs/API.md
+index 4382bd9..09a60d6 100644
+--- a/docs/API.md
++++ b/docs/API.md
+@@ -12,7 +12,7 @@
+ | `POST /api/wiki/pages` | 编辑专题；更新带 `id,expectedRevision` |
+ | `POST /api/wiki/model/test` | `{}`，测试模型 |
+ | `POST /api/wiki/chat` | `{messages:[{role,content}]}`，连续问答 |
+-| `POST /api/rag/chat` | 同上；当前返回 501 |
++| `POST /api/rag/chat` | 同上；代理至 HXrag 检索问答服务 |
+ 
+ 解析返回 `{title,content,sourceUrl,format}`，不写库。单份 JSON 资料需含 `content`，可含 `title` 和来源字段。
+ 
+diff --git a/docs/DEVELOPMENT.md b/docs/DEVELOPMENT.md
+index 5aaa0b2..529878d 100644
+--- a/docs/DEVELOPMENT.md
++++ b/docs/DEVELOPMENT.md
+@@ -1,8 +1,8 @@
+ # 开发
+ 
+-- 本地入口：`127.0.0.1:5173`；内部 Wiki：`127.0.0.1:8787`。可用 `PORT`、`WIKI_PORT` 修改。
++- 本地入口：`127.0.0.1:5173`；内部 Wiki：`127.0.0.1:8787`；HXrag：`127.0.0.1:8790`。可用 `PORT`、`WIKI_PORT`、`RAG_PORT` 修改。
+ - SQLite 和内部凭据保存在 `llm-wiki/.wiki-data/`；对话历史保存在浏览器本地。
+-- 模型配置优先使用运行环境，其次为根目录 `.env.local`：`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`。
++- Wiki 模型配置优先使用运行环境，其次为根目录 `.env.local`：`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL`。RAG 使用 HXrag `config.json` 中的 Kimi 配置。
+ - Wiki 问答按词项选择相关专题，每轮最多最近 10 轮、1.2 万历史字符及 4.8 万 Wiki 字符。答案引用映射至现有证据，不写专题。
+ - `npm test` 使用本地测试数据与模拟模型；`npm run test:live` 调用真实 DeepSeek，输出每项结果。
+ - Wiki 原实现来自随项目提供的 `radio-wiki-source-v2.zip`；保留独立服务、迁移、核心测试和团队示例。
+diff --git a/frontend/server/index.mjs b/frontend/server/index.mjs
+index 3483365..9f7d277 100644
+--- a/frontend/server/index.mjs
++++ b/frontend/server/index.mjs
+@@ -6,11 +6,10 @@ import {fileURLToPath} from 'node:url';
+ import {resolve, dirname, extname, sep} from 'node:path';
+ import {loadEnvFile} from 'node:process';
+ import {parseFile,parseURL,MAX_FILE_BYTES} from '@satellite/llm-wiki/imports';
+-import {chat as ragChat} from '@satellite/rag';
+ 
+ const frontend=resolve(dirname(fileURLToPath(import.meta.url)),'..'),root=resolve(frontend,'..');
+ if(existsSync(resolve(root,'.env.local'))&&process.env.WIKI_SKIP_ENV_FILE!=='true')loadEnvFile(resolve(root,'.env.local'));
+-const dev=process.argv.includes('--dev'),port=Number(process.env.PORT||5173),wikiPort=Number(process.env.WIKI_PORT||8787);
++const dev=process.argv.includes('--dev'),port=Number(process.env.PORT||5173),wikiPort=Number(process.env.WIKI_PORT||8787),ragPort=Number(process.env.RAG_PORT||8790);
+ const dataDir=resolve(process.env.WIKI_DATA_DIR||resolve(root,'llm-wiki/.wiki-data'));
+ const wiki=spawn(process.execPath,[resolve(root,'llm-wiki/dist/server.mjs')],{cwd:resolve(root,'llm-wiki'),env:{...process.env,PORT:String(wikiPort),HOST:'127.0.0.1',WIKI_DATA_DIR:dataDir},stdio:['ignore','pipe','pipe']});
+ let vite,server,stopping=false;
+@@ -53,7 +52,11 @@ try {
+           res.writeHead(upstream.status,{'Content-Type':upstream.headers.get('content-type')||'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});
+           return res.end(Buffer.from(await upstream.arrayBuffer()));
+         }
+-        if(url.pathname==='/api/rag/chat'&&req.method==='POST') {await body(req,2000000);const response=ragChat();return json(res,await response.json(),response.status);}
++        if(url.pathname==='/api/rag/chat'&&req.method==='POST') {
++          const upstream=await fetch(`http://127.0.0.1:${ragPort}/api/rag/chat`,{method:'POST',headers:{'Content-Type':'application/json'},body:await body(req,2000000),signal:AbortSignal.timeout(180000),redirect:'error'});
++          res.writeHead(upstream.status,{'Content-Type':upstream.headers.get('content-type')||'application/json','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});
++          return res.end(Buffer.from(await upstream.arrayBuffer()));
++        }
+         if(url.pathname==='/api/import/file'&&req.method==='POST') {
+           const request=new Request(origin+url.pathname,{method:'POST',headers:{'Content-Type':req.headers['content-type']||''},body:await body(req)});
+           let form;try{form=await request.formData();}catch{return json(res,{error:'文件格式不正确。'},400);}
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 1c4fdf9..8a6a72e 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -16,7 +16,7 @@ export function App() {
+   const [source,setSource]=useState<Source|null>(null),[pageId,setPageId]=useState<string|null>(null),[editing,setEditing]=useState(false),[pageTitle,setPageTitle]=useState(''),[pageText,setPageText]=useState(''),[saving,setSaving]=useState(false);
+   const [toast,setToast]=useState(''),[search,setSearch]=useState(''),[testing,setTesting]=useState(false),[tested,setTested]=useState(false);
+   const bottom=useRef<HTMLDivElement>(null),input=useRef<HTMLTextAreaElement>(null);
+-  const current=conversations.find(c=>c.id===currentId),currentMode=current?.mode||mode,pending=currentId?busy.has(currentId):false;
++  const current=conversations.find(c=>c.id===currentId),pending=currentId?busy.has(currentId):false;
+   const selectedPage=snapshot.pages.find(p=>p.id===pageId);
+   async function refresh(){const data=await api<Snapshot>('/api/wiki/snapshot');setSnapshot(data);}
+   useEffect(()=>{refresh().catch(e=>setToast(e.message)).finally(()=>setLoading(false));},[]);
+@@ -60,7 +60,7 @@ export function App() {
+     <main className="main">
+       <header className="topbar"><div className="topbar-title"><button className="icon-button mobile-menu" aria-label="打开导航" onClick={()=>setSidebar(true)}><Menu size={20}/></button><span>{view==='chat'?'问答':view==='sources'?'资料':'Wiki'}</span>{view==='chat'&&current&&<span className="mode-badge">{current.mode==='wiki'?'Wiki':'RAG'}</span>}</div><div className="topbar-right">{loading&&<Spinner/>}{view==='sources'&&<button className="button small" onClick={()=>setImporting(true)}><Plus size={15}/>导入资料</button>}{view==='wiki'&&!selectedPage&&<button className="button small" onClick={()=>setBuilding(true)}><Plus size={15}/>构建 Wiki</button>}</div></header>
+       {view==='chat'&&<section className={`chat-view ${!current?.messages.length?'empty-chat':''}`}>
+-        {!current?.messages.length?<div className="chat-welcome"><div className="welcome-orbit"><Orbit size={38} strokeWidth={1.05}/></div><h1>有什么问题？</h1><div className="mode-switch" aria-label="问答模式">{(['wiki','rag'] as const).map(m=><button className={mode===m?'selected':''} key={m} onClick={()=>setMode(m)}>{m==='wiki'?'Wiki':'RAG'}</button>)}</div>{mode==='rag'&&<p className="rag-status">后端未实现</p>}</div>:<div className="messages">{current.messages.map(m=><article key={m.id} className={`message ${m.role}`}><div className="message-label">{m.role==='user'?'你':current.mode==='wiki'?'Wiki':'RAG'}</div>{m.role==='user'?<p className="user-content">{m.content}</p>:<><RenderMarkdown>{m.content}</RenderMarkdown><Citations citations={m.citations||[]} onSource={openSource} onPage={openPage}/></>}</article>)}{pending&&<div className="thinking"><Spinner/><span>回答中</span></div>}{current?.mode==='rag'&&!errors[current.id]&&<div className="chat-error">后端未实现</div>}{currentId&&errors[currentId]&&<div className="chat-error" role="alert"><span>{errors[currentId]}</span>{currentMode==='wiki'&&<button className="text-link" onClick={()=>void send(true)}>重试</button>}</div>}<div ref={bottom}/></div>}
++        {!current?.messages.length?<div className="chat-welcome"><div className="welcome-orbit"><Orbit size={38} strokeWidth={1.05}/></div><h1>有什么问题？</h1><div className="mode-switch" aria-label="问答模式">{(['wiki','rag'] as const).map(m=><button className={mode===m?'selected':''} key={m} onClick={()=>setMode(m)}>{m==='wiki'?'Wiki':'RAG'}</button>)}</div></div>:<div className="messages">{current.messages.map(m=><article key={m.id} className={`message ${m.role}`}><div className="message-label">{m.role==='user'?'你':current.mode==='wiki'?'Wiki':'RAG'}</div>{m.role==='user'?<p className="user-content">{m.content}</p>:<><RenderMarkdown>{m.content}</RenderMarkdown><Citations citations={m.citations||[]} onSource={openSource} onPage={openPage}/></>}</article>)}{pending&&<div className="thinking"><Spinner/><span>回答中</span></div>}{currentId&&errors[currentId]&&<div className="chat-error" role="alert"><span>{errors[currentId]}</span><button className="text-link" onClick={()=>void send(true)}>重试</button></div>}<div ref={bottom}/></div>}
+         <form className="composer" onSubmit={e=>{e.preventDefault();void send();}}><textarea ref={input} aria-label="输入问题" placeholder="输入问题…" rows={1} value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey&&!e.nativeEvent.isComposing){e.preventDefault();void send();}}}/><button className="send-button" disabled={!question.trim()||pending} aria-label="发送">{pending?<Spinner/>:<ArrowUp size={19}/>}</button></form>
+       </section>}
+       {view==='sources'&&<section className="workspace"><div className="page-heading"><div><div className="eyebrow">资料库</div><h1>原始资料<span>{snapshot.documents.length}</span></h1></div>{snapshot.documents.length>0&&<div className="search"><Search size={15}/><input aria-label="查找资料" placeholder="查找资料" value={search} onChange={e=>setSearch(e.target.value)}/></div>}</div>{snapshot.documents.length===0?<div className="empty-state"><Files size={34} strokeWidth={1.1}/><p>还没有资料</p><button className="text-link" onClick={()=>setImporting(true)}>导入资料<ArrowUpRight size={14}/></button></div>:<div className="data-list">{filteredSources.map(s=><button className="data-row" key={s.id} onClick={()=>setSource(s)}><span className="row-icon"><FileText size={19} strokeWidth={1.4}/></span><span className="row-main"><strong>{s.title}</strong><small>{s.sourceUrl?new URL(s.sourceUrl).hostname:'本地导入'}<span>·</span>{s.content.length.toLocaleString()} 字符</small></span><span className="row-date">{date(s.updatedAt)}</span><ChevronRight size={16}/></button>)}{!filteredSources.length&&<div className="empty-search">没有匹配资料</div>}</div>}</section>}
+diff --git a/frontend/tests/gateway.test.mjs b/frontend/tests/gateway.test.mjs
+index f08a32f..cb6741d 100644
+--- a/frontend/tests/gateway.test.mjs
++++ b/frontend/tests/gateway.test.mjs
+@@ -1,10 +1,13 @@
+ import test from 'node:test';
+ import assert from 'node:assert/strict';
+ import {readFile} from 'node:fs/promises';
++import {createServer} from 'node:http';
+ import {startDemo,request} from './helpers.mjs';
+ 
+ test('页面无登录、预览不写库、导入构建与引用接口可用',async t=>{
+-  const demo=await startDemo();t.after(demo.close);
++  const ragServer=createServer((req,res)=>{let body='';req.on('data',chunk=>body+=chunk);req.on('end',()=>{res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({message:{role:'assistant',content:'RAG 测试回答[1]',citations:[],relatedPages:[]}}));});});
++  await new Promise(resolve=>ragServer.listen(0,'127.0.0.1',resolve));t.after(()=>new Promise(resolve=>ragServer.close(resolve)));
++  const demo=await startDemo({RAG_PORT:String(ragServer.address().port)});t.after(demo.close);
+   const snapshot=await request(demo.base,'/api/wiki/snapshot');assert.equal(snapshot.status,200);assert.equal(snapshot.data.documents.length,0);assert.equal(snapshot.data.settings.model.keyConfigured,false);
+   assert.equal((await fetch(demo.base)).status,200);
+   assert.equal((await fetch(`http://127.0.0.1:${demo.wikiPort}/api/wiki/snapshot`)).status,401);
+@@ -17,7 +20,7 @@ test('页面无登录、预览不写库、导入构建与引用接口可用',asy
+   const page=await request(demo.base,'/api/wiki/pages',{title:'卫星终端',content:'卫星终端工作频率为14 GHz，带宽为36 MHz，均记录在原始资料中。[1]',citations:[{sourceId:source.data.id,quote:'终端工作频率为 14 GHz，带宽为 36 MHz。',section:'正文'}]});assert.equal(page.status,200);
+   const emptyChat=await request(demo.base,'/api/wiki/chat',{messages:[{role:'user',content:'恐龙化石'}]});assert.equal(emptyChat.status,200);assert.equal(emptyChat.data.message.citations.length,0);
+   assert.equal((await request(demo.base,'/api/wiki/chat',{messages:[{role:'user',content:'卫星终端频率'}]})).status,409);
+-  const rag=await request(demo.base,'/api/rag/chat',{messages:[{role:'user',content:'卫星终端频率'}]});assert.equal(rag.status,501);assert.equal(rag.data.error,'RAG 后端未实现');
++  const rag=await request(demo.base,'/api/rag/chat',{messages:[{role:'user',content:'卫星终端频率'}]});assert.equal(rag.status,200);assert.equal(rag.data.message.content,'RAG 测试回答[1]');
+   assert.equal((await request(demo.base,'/api/import/url',{url:'http://127.0.0.1/private'})).status,400);
+   assert.equal((await request(demo.base,'/api/wiki/snapshot')).data.pages.length,1);
+ });
